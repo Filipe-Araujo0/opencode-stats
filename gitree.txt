@@ -1,0 +1,4 @@
+Legend: path:{lines}  (lines = total number of lines via wc -l)
+.  [error opening dir]
+
+0 directories, 1 file
