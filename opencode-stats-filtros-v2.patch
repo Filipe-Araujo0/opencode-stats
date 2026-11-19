@@ -1,0 +1,735 @@
+diff --git a/README.md b/README.md
+index 436fd75..d81a610 100644
+--- a/README.md
++++ b/README.md
+@@ -6,23 +6,56 @@ Analisador local e somente leitura das estatísticas persistidas pelo OpenCode.
+ 
+ ```bash
+ python -m opencode_stats --date today
+-python -m opencode_stats --date 2026-08-22 --json
+-```
+-
+-Por padrão, o CLI lê `~/.local/share/opencode/opencode.db`. Use `--database`
+-para informar outro banco SQLite.
++python -m opencode_stats --date 2026-11-19 --json
+ 
+-O relatório usa os totais agregados por sessão e calcula a taxa de cache hit
+-como `cache_read / (cache_read + input)`, quando o denominador é maior que zero.
++# Filtros combináveis: provedor, modelo e intervalo de horário local
++python -m opencode_stats --date today --provider anthropic
++python -m opencode_stats --date today --model claude-sonnet-4-5
++python -m opencode_stats --date 2026-11-19 --start-time 09:00 --end-time 12:30
++python -m opencode_stats --date 2026-11-19 --provider openai --model gpt-5 --start-time 14:00 --end-time 18:00 --json
+ 
+-## Compatibilidade de schema
+-
+-O leitor detecta automaticamente o schema do OpenCode v2 (`session_v2`) ou o
+-schema anterior (`session`). Quando as duas tabelas existem, usa somente
+-`session_v2`, evitando a contagem dupla de sessões migradas. O banco é aberto
+-em modo somente leitura, sem alterações nem migrações.
++# Janela atravessando a meia-noite: 19/11 22:00 até 20/11 02:00
++python -m opencode_stats --date 2026-11-19 --start-time 22:00 --end-time 02:00
++```
+ 
+-**Importante:** o filtro `--date` seleciona sessões pela data de criação
+-(`time_created`), e o resultado apresenta os totais acumulados dessas sessões.
+-Uma sessão com atividades em vários dias entra inteira no dia em que foi criada;
+-portanto, este não é um relatório de consumo estritamente diário.
++Por padrão, o CLI lê `~/.local/share/opencode/opencode.db`. Use `--database`
++para informar outro banco SQLite. Os identificadores `--model` e `--provider`
++exigem correspondência exata com os IDs do OpenCode (por exemplo, `openai`,
++`anthropic`, e o ID do modelo efetivamente usado).
++
++`--start-time` (`--from-time`) é inclusivo e `--end-time` (`--to-time`) é exclusivo.
++Ambos aceitam `HH:MM` em **horário local do computador** que executa o comando.
++Na ausência de um limite, usa-se o início ou fim do dia selecionado. Se o fim
++informado for igual ou anterior ao início, o fim passa a ser no dia seguinte.
++
++## Como os filtros funcionam
++
++**Sem os novos filtros:** conserva o comportamento original: seleciona sessões
++pela data de criação (`session_v2.time_created` ou `session.time_created`) e
++soma os **totais acumulados por sessão**. Uma sessão com atividades em vários
++dias entra inteira no dia em que foi criada, portanto não é um consumo
++diário preciso.
++
++**Com qualquer filtro de modelo, provedor ou horário:** usa o schema v2 e calcula
++o consumo por **mensagens do assistente** em `session_message`. Os filtros de
++data e horário usam `session_message.time_created`, mesmo quando a sessão foi
++criada antes da data selecionada. São somados apenas tokens e custos das
++mensagens correspondentes, e não da sessão inteira.
++
++O relatório retorna uma linha por sessão com atividade selecionada; o
++`session_count` não aumenta quando há vários modelos na mesma sessão. Os
++campos `model` e `provider` da sessão são `null` quando há múltiplos valores
++(ou valores desconhecidos) entre as mensagens selecionadas. O JSON apresenta
++`aggregation` (`session`/`message`) e `filters`, incluindo os limites em
++milissegundos desde a época Unix, com limite final exclusivo.
++
++Os filtros dependem das tabelas `session_v2` e `session_message` do OpenCode v2.
++No schema legado, o programa mostra um erro explicativo em vez de atribuir
++consumo ao modelo ou provedor errado. A seleção por hora usa a criação da
++mensagem do assistente, não o horário de conclusão da resposta. Custos de
++compactação registrados apenas como eventos, sem mensagem correspondente,
++não podem ser atribuídos a provedor/modelo por este relatório filtrado.
++
++O banco é aberto em modo somente leitura, sem alterações nem migrações. A taxa
++de cache hit usa `cache_read / (cache_read + input)`, quando o denominador é
++maior que zero.
+diff --git a/opencode_stats/cli.py b/opencode_stats/cli.py
+index 93e8089..d3b81c6 100644
+--- a/opencode_stats/cli.py
++++ b/opencode_stats/cli.py
+@@ -1,5 +1,7 @@
+ import argparse
+ import json
++import re
++import sqlite3
+ from datetime import date, datetime, time, timedelta
+ from pathlib import Path
+ 
+@@ -14,28 +16,110 @@ def _date_range(value: str) -> tuple[date, int, int]:
+     return selected, int(start), int(end)
+ 
+ 
++def _clock_time(value: str) -> time:
++    if not re.fullmatch(r"\d{2}:\d{2}", value):
++        raise argparse.ArgumentTypeError("Informe o horário local no formato HH:MM (ex.: 09:30)")
++    try:
++        return time.fromisoformat(value)
++    except ValueError as error:
++        raise argparse.ArgumentTypeError("Horário inválido: " + value) from error
++
++
++def _activity_range(
++    selected: date, start_time: time | None, end_time: time | None
++) -> tuple[int, int]:
++    start = datetime.combine(selected, start_time or time.min).astimezone()
++    if end_time is None:
++        end_date = selected + timedelta(days=1)
++        end_clock = time.min
++    else:
++        end_date = selected
++        end_clock = end_time
++        if end_clock <= (start_time or time.min):
++            end_date += timedelta(days=1)
++    end = datetime.combine(end_date, end_clock).astimezone()
++    return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
++
++
+ def main() -> None:
+-    parser = argparse.ArgumentParser(description=__doc__)
++    parser = argparse.ArgumentParser(description="Estatísticas locais do OpenCode (somente leitura)")
+     parser.add_argument("--date", default="today", help="today ou data ISO YYYY-MM-DD")
+     parser.add_argument("--database", type=Path, default=DEFAULT_DATABASE)
++    parser.add_argument("--model", help="ID exato do modelo no OpenCode (ex.: claude-sonnet-4-5)")
++    parser.add_argument("--provider", help="ID exato do provedor no OpenCode (ex.: anthropic)")
++    parser.add_argument(
++        "--start-time", "--from-time", dest="start_time", type=_clock_time,
++        metavar="HH:MM", help="Horário inicial local (inclusivo) da data selecionada",
++    )
++    parser.add_argument(
++        "--end-time", "--to-time", dest="end_time", type=_clock_time,
++        metavar="HH:MM", help="Horário final local (exclusivo); pode passar da meia-noite",
++    )
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     args = parser.parse_args()
+ 
+-    selected, start_ms, end_ms = _date_range(args.date)
+-    report = build_report(
+-        read_sessions(args.database, start_ms, end_ms), selected.isoformat()
++    try:
++        selected, start_ms, end_ms = _date_range(args.date)
++    except ValueError as error:
++        parser.error(f"Data inválida em --date: {error}")
++
++    filtered = any(
++        item is not None
++        for item in (args.model, args.provider, args.start_time, args.end_time)
+     )
++    if args.start_time is not None or args.end_time is not None:
++        start_ms, end_ms = _activity_range(selected, args.start_time, args.end_time)
++
++    try:
++        report = build_report(
++            read_sessions(
++                args.database, start_ms, end_ms,
++                model=args.model,
++                provider=args.provider,
++                message_usage=filtered,
++            ),
++            selected.isoformat(),
++        )
++    except (OSError, ValueError, sqlite3.DatabaseError) as error:
++        parser.error(str(error))
++
++    report["aggregation"] = "message" if filtered else "session"
++    report["filters"] = {
++        "model": args.model,
++        "provider": args.provider,
++        "start_time": args.start_time.isoformat(timespec="minutes") if args.start_time else None,
++        "end_time": args.end_time.isoformat(timespec="minutes") if args.end_time else None,
++        "start_ms": start_ms,
++        "end_ms_exclusive": end_ms,
++    }
+     if args.as_json:
+         print(json.dumps(report, ensure_ascii=False, indent=2))
+         return
+ 
+     totals = report["totals"]
+     print(f"OpenCode stats: {report['date']}")
++    if filtered:
++        print("Agregação: mensagens do assistente (horário da atividade)")
++        if args.model:
++            print(f"Modelo: {args.model}")
++        if args.provider:
++            print(f"Provedor: {args.provider}")
++        print(
++            f"Janela (horário local): "
++            f"{datetime.fromtimestamp(start_ms / 1000).astimezone():%Y-%m-%d %H:%M} "
++            f"até {datetime.fromtimestamp(end_ms / 1000).astimezone():%Y-%m-%d %H:%M} "
++            "(limite final exclusivo)"
++        )
+     print(f"Sessões: {report['session_count']}")
+     print(f"Input: {totals['input_tokens']}")
+     print(f"Output: {totals['output_tokens']}")
+     print(f"Reasoning: {totals['reasoning_tokens']}")
+     print(f"Cache read: {totals['cache_read_tokens']}")
+     print(f"Cache write: {totals['cache_write_tokens']}")
++    print(f"Custo (USD): {totals['cost']}")
+     print(f"Cache hit rate: {totals['cache_hit_rate']}")
+     print(f"Sessões sem usage: {report['sessions_without_usage']}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/opencode_stats/database.py b/opencode_stats/database.py
+index 8dfffd7..3a4b0dd 100644
+--- a/opencode_stats/database.py
++++ b/opencode_stats/database.py
+@@ -1,3 +1,4 @@
++import json
+ import sqlite3
+ from collections.abc import Iterator
+ from pathlib import Path
+@@ -7,17 +8,17 @@ from .models import SessionUsage
+ DEFAULT_DATABASE = Path.home() / ".local" / "share" / "opencode" / "opencode.db"
+ 
+ 
+-def _session_table(connection: sqlite3.Connection) -> str:
+-    tables = {
++def _tables(connection: sqlite3.Connection) -> set[str]:
++    return {
+         row[0]
+         for row in connection.execute(
+-            """
+-            SELECT name
+-            FROM sqlite_master
+-            WHERE type = 'table' AND name IN ('session_v2', 'session')
+-            """
++            "SELECT name FROM sqlite_master WHERE type = 'table'"
+         )
+     }
++
++
++def _session_table(connection: sqlite3.Connection) -> str:
++    tables = _tables(connection)
+     if "session_v2" in tables:
+         return "session_v2"
+     if "session" in tables:
+@@ -28,35 +29,163 @@ def _session_table(connection: sqlite3.Connection) -> str:
+     )
+ 
+ 
+-def read_sessions(database: Path, start_ms: int, end_ms: int) -> Iterator[SessionUsage]:
++def _session_model(value: str | None, schema: str) -> tuple[str | None, str | None]:
++    if schema != "session_v2" or value is None:
++        return value, None
++    try:
++        parsed = json.loads(value)
++    except (json.JSONDecodeError, TypeError):
++        return value, None
++    if not isinstance(parsed, dict):
++        return value, None
++    model_id = parsed.get("id")
++    provider_id = parsed.get("providerID")
++    return (
++        model_id if isinstance(model_id, str) else None,
++        provider_id if isinstance(provider_id, str) else None,
++    )
++
++
++def _read_session_totals(
++    connection: sqlite3.Connection, table: str, start_ms: int, end_ms: int
++) -> Iterator[SessionUsage]:
++    # The table name is selected from two fixed, internal identifiers above.
++    rows = connection.execute(
++        f"""
++        SELECT id, title, directory, model, time_created,
++               tokens_input, tokens_output, tokens_reasoning,
++               tokens_cache_read, tokens_cache_write, cost
++        FROM {table}
++        WHERE time_created >= ? AND time_created < ?
++        ORDER BY time_created, id
++        """,
++        (start_ms, end_ms),
++    )
++    for row in rows:
++        model, provider = _session_model(row["model"], table)
++        yield SessionUsage(
++            session_id=row["id"],
++            title=row["title"],
++            directory=row["directory"],
++            model=model,
++            created_at_ms=row["time_created"],
++            input_tokens=row["tokens_input"],
++            output_tokens=row["tokens_output"],
++            reasoning_tokens=row["tokens_reasoning"],
++            cache_read_tokens=row["tokens_cache_read"],
++            cache_write_tokens=row["tokens_cache_write"],
++            cost=row["cost"],
++            provider=provider,
++        )
++
++
++def _read_message_totals(
++    connection: sqlite3.Connection,
++    start_ms: int,
++    end_ms: int,
++    model: str | None,
++    provider: str | None,
++) -> Iterator[SessionUsage]:
++    if "session_message" not in _tables(connection):
++        raise ValueError(
++            "OpenCode v2 message table 'session_message' not found. "
++            "Model, provider and time filters require per-message usage."
++        )
++
++    conditions = [
++        "message.type = 'assistant'",
++        "message.time_created >= ?",
++        "message.time_created < ?",
++    ]
++    params: list[str | int] = [start_ms, end_ms]
++
++    # Forked sessions can contain copied messages from an earlier session.
++    # The current v2 schema marks those messages via fork_session_id.
++    columns = {row[1] for row in connection.execute("PRAGMA table_info(session_v2)")}
++    if "fork_session_id" in columns:
++        conditions.append(
++            "(session.fork_session_id IS NULL OR "
++            "message.time_created >= session.time_created)"
++        )
++    if model is not None:
++        conditions.append("json_extract(message.data, '$.model.id') = ?")
++        params.append(model)
++    if provider is not None:
++        conditions.append("json_extract(message.data, '$.model.providerID') = ?")
++        params.append(provider)
++
++    where_clause = " AND ".join(conditions)
++    rows = connection.execute(
++        f"""
++        SELECT
++            session.id AS session_id,
++            session.title AS title,
++            session.directory AS directory,
++            session.time_created AS created_at_ms,
++            CASE
++                WHEN COUNT(DISTINCT json_extract(message.data, '$.model.id')) = 1
++                 AND COUNT(json_extract(message.data, '$.model.id')) = COUNT(*)
++                THEN MIN(json_extract(message.data, '$.model.id'))
++                ELSE NULL
++            END AS model,
++            CASE
++                WHEN COUNT(DISTINCT json_extract(message.data, '$.model.providerID')) = 1
++                 AND COUNT(json_extract(message.data, '$.model.providerID')) = COUNT(*)
++                THEN MIN(json_extract(message.data, '$.model.providerID'))
++                ELSE NULL
++            END AS provider,
++            SUM(COALESCE(json_extract(message.data, '$.tokens.input'), 0)) AS input_tokens,
++            SUM(COALESCE(json_extract(message.data, '$.tokens.output'), 0)) AS output_tokens,
++            SUM(COALESCE(json_extract(message.data, '$.tokens.reasoning'), 0)) AS reasoning_tokens,
++            SUM(COALESCE(json_extract(message.data, '$.tokens.cache.read'), 0)) AS cache_read_tokens,
++            SUM(COALESCE(json_extract(message.data, '$.tokens.cache.write'), 0)) AS cache_write_tokens,
++            SUM(COALESCE(json_extract(message.data, '$.cost'), 0)) AS cost
++        FROM session_message AS message
++        JOIN session_v2 AS session ON session.id = message.session_id
++        WHERE {where_clause}
++        GROUP BY session.id
++        ORDER BY MIN(message.time_created), session.id
++        """,
++        params,
++    )
++    for row in rows:
++        yield SessionUsage(
++            session_id=row["session_id"],
++            title=row["title"],
++            directory=row["directory"],
++            model=row["model"],
++            created_at_ms=row["created_at_ms"],
++            input_tokens=row["input_tokens"],
++            output_tokens=row["output_tokens"],
++            reasoning_tokens=row["reasoning_tokens"],
++            cache_read_tokens=row["cache_read_tokens"],
++            cache_write_tokens=row["cache_write_tokens"],
++            cost=row["cost"],
++            provider=row["provider"],
++        )
++
++
++def read_sessions(
++    database: Path,
++    start_ms: int,
++    end_ms: int,
++    *,
++    model: str | None = None,
++    provider: str | None = None,
++    message_usage: bool = False,
++) -> Iterator[SessionUsage]:
+     connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+     connection.row_factory = sqlite3.Row
+     try:
+         session_table = _session_table(connection)
+-        rows = connection.execute(
+-            """
+-            SELECT id, title, directory, model, time_created,
+-                   tokens_input, tokens_output, tokens_reasoning,
+-                   tokens_cache_read, tokens_cache_write, cost
+-            FROM {session_table}
+-            WHERE time_created >= ? AND time_created < ?
+-            ORDER BY time_created, id
+-            """.format(session_table=session_table),
+-            (start_ms, end_ms),
+-        )
+-        for row in rows:
+-            yield SessionUsage(
+-                session_id=row["id"],
+-                title=row["title"],
+-                directory=row["directory"],
+-                model=row["model"],
+-                created_at_ms=row["time_created"],
+-                input_tokens=row["tokens_input"],
+-                output_tokens=row["tokens_output"],
+-                reasoning_tokens=row["tokens_reasoning"],
+-                cache_read_tokens=row["tokens_cache_read"],
+-                cache_write_tokens=row["tokens_cache_write"],
+-                cost=row["cost"],
+-            )
++        if model is not None or provider is not None or message_usage:
++            if session_table != "session_v2":
++                raise ValueError(
++                    "Model, provider and time filters require the OpenCode v2 "
++                    "schema ('session_v2' and 'session_message')."
++                )
++            yield from _read_message_totals(connection, start_ms, end_ms, model, provider)
++        else:
++            yield from _read_session_totals(connection, session_table, start_ms, end_ms)
+     finally:
+         connection.close()
+diff --git a/opencode_stats/models.py b/opencode_stats/models.py
+index f30a65a..186bd1a 100644
+--- a/opencode_stats/models.py
++++ b/opencode_stats/models.py
+@@ -15,6 +15,7 @@ class SessionUsage:
+     cache_read_tokens: int
+     cache_write_tokens: int
+     cost: float
++    provider: str | None = None
+ 
+     @property
+     def cache_hit_rate(self) -> float | None:
+diff --git a/tests/test_filters.py b/tests/test_filters.py
+new file mode 100644
+index 0000000..4eba072
+--- /dev/null
++++ b/tests/test_filters.py
+@@ -0,0 +1,288 @@
++import argparse
++import json
++import sqlite3
++import subprocess
++import sys
++from datetime import date, time
++from pathlib import Path
++
++import pytest
++
++from opencode_stats.cli import _activity_range, _clock_time, _date_range
++from opencode_stats.database import read_sessions
++from opencode_stats.report import build_report
++
++
++def make_database(database: Path) -> None:
++    with sqlite3.connect(database) as connection:
++        connection.executescript(
++            """
++            CREATE TABLE session_v2 (
++                id TEXT PRIMARY KEY,
++                title TEXT,
++                directory TEXT NOT NULL,
++                model TEXT,
++                fork_session_id TEXT,
++                time_created INTEGER NOT NULL,
++                tokens_input INTEGER NOT NULL DEFAULT 0,
++                tokens_output INTEGER NOT NULL DEFAULT 0,
++                tokens_reasoning INTEGER NOT NULL DEFAULT 0,
++                tokens_cache_read INTEGER NOT NULL DEFAULT 0,
++                tokens_cache_write INTEGER NOT NULL DEFAULT 0,
++                cost REAL NOT NULL DEFAULT 0
++            );
++            CREATE TABLE session_message (
++                id TEXT PRIMARY KEY,
++                session_id TEXT NOT NULL,
++                type TEXT NOT NULL,
++                time_created INTEGER NOT NULL,
++                data TEXT NOT NULL
++            );
++            """
++        )
++
++
++def insert_session(
++    database: Path,
++    session_id: str,
++    created_at_ms: int,
++    *,
++    model: str | None = None,
++    provider: str = "openai",
++    fork_session_id: str | None = None,
++) -> None:
++    with sqlite3.connect(database) as connection:
++        connection.execute(
++            """
++            INSERT INTO session_v2 (
++                id, title, directory, model, fork_session_id,
++                time_created, tokens_input, cost
++            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
++            """,
++            (
++                session_id, "Session title", "/tmp/repo",
++                json.dumps({"id": model, "providerID": provider}) if model else None,
++                fork_session_id, created_at_ms, 999, 88.0,
++            ),
++        )
++
++
++def insert_message(
++    database: Path,
++    message_id: str,
++    session_id: str,
++    created_at_ms: int,
++    *,
++    model: str | None = "model-a",
++    provider: str | None = "openai",
++    input_tokens: int | None = 20,
++    output_tokens: int | None = 10,
++    cache_read_tokens: int | None = 30,
++    cost: float = 0.25,
++    role: str = "assistant",
++) -> None:
++    model_info = {"id": model, "providerID": provider} if model is not None else {}
++    payload = {
++        "model": model_info,
++        "tokens": {
++            "input": input_tokens,
++            "output": output_tokens,
++            "reasoning": 2,
++            "cache": {"read": cache_read_tokens, "write": 5},
++        },
++        "cost": cost,
++    }
++    with sqlite3.connect(database) as connection:
++        connection.execute(
++            """
++            INSERT INTO session_message (id, session_id, type, time_created, data)
++            VALUES (?, ?, ?, ?, ?)
++            """,
++            (message_id, session_id, role, created_at_ms, json.dumps(payload)),
++        )
++
++
++def test_unfiltered_v2_stays_session_based_and_parses_model_json(tmp_path: Path) -> None:
++    database = tmp_path / "opencode.db"
++    make_database(database)
++    insert_session(database, "ses1", 1000, model="model-old", provider="anthropic")
++    insert_message(database, "msg1", "ses1", 2000)
++
++    sessions = list(read_sessions(database, 0, 3000))
++
++    assert len(sessions) == 1
++    assert sessions[0].input_tokens == 999
++    assert sessions[0].model == "model-old"
++    assert sessions[0].provider == "anthropic"
++
++
++def test_model_and_provider_filter_each_message_not_session(tmp_path: Path) -> None:
++    database = tmp_path / "opencode.db"
++    make_database(database)
++    insert_session(database, "ses1", 1000, model="model-old", provider="other")
++    insert_message(database, "msg1", "ses1", 2000, model="model-a", provider="openai")
++    insert_message(database, "msg2", "ses1", 3000, model="model-a", provider="anthropic")
++    insert_message(database, "msg3", "ses1", 4000, model="model-b", provider="openai")
++    insert_message(database, "msg4", "ses1", 4000, model="model-a", provider="openai", role="user")
++
++    sessions = list(read_sessions(database, 1500, 5000, model="model-a", provider="openai"))
++    report = build_report(sessions, "2026-11-19")
++
++    assert report["session_count"] == 1
++    assert report["totals"]["input_tokens"] == 20
++    assert report["totals"]["cache_hit_rate"] == 0.6
++    assert report["totals"]["cost"] == 0.25
++    assert sessions[0].model == "model-a"
++    assert sessions[0].provider == "openai"
++    assert sessions[0].created_at_ms == 1000
++
++
++def test_filters_aggregate_only_matching_messages_for_older_session(tmp_path: Path) -> None:
++    database = tmp_path / "opencode.db"
++    make_database(database)
++    insert_session(database, "old_session", 1000, model="model-old")
++    insert_session(database, "second", 1000)
++    insert_message(database, "msg1", "old_session", 2200, model="model-a", input_tokens=10)
++    insert_message(database, "msg2", "old_session", 3200, model="model-a", input_tokens=15)
++    insert_message(database, "msg3", "second", 1200, model="model-a", input_tokens=50)
++
++    sessions = list(read_sessions(database, 2000, 4000, model="model-a"))
++
++    assert len(sessions) == 1
++    assert sessions[0].session_id == "old_session"
++    assert sessions[0].input_tokens == 25
++    assert sessions[0].output_tokens == 20
++    assert sessions[0].cost == 0.5
++
++
++def test_multiple_models_in_one_session_are_not_misattributed(tmp_path: Path) -> None:
++    database = tmp_path / "opencode.db"
++    make_database(database)
++    insert_session(database, "ses1", 1000)
++    insert_message(database, "msg1", "ses1", 2000, model="model-a", provider="openai")
++    insert_message(database, "msg2", "ses1", 2500, model="model-b", provider="anthropic")
++
++    sessions = list(read_sessions(database, 1000, 3000, message_usage=True))
++    report = build_report(sessions, "2026-11-19")
++
++    assert report["session_count"] == 1
++    assert report["totals"]["input_tokens"] == 40
++    assert sessions[0].model is None
++    assert sessions[0].provider is None
++
++
++def test_missing_token_fields_are_zero_and_null_model_is_unknown(tmp_path: Path) -> None:
++    database = tmp_path / "opencode.db"
++    make_database(database)
++    insert_session(database, "ses1", 1000)
++    insert_message(database, "msg1", "ses1", 2000, model=None,
++                   input_tokens=None, output_tokens=None, cache_read_tokens=None)
++
++    sessions = list(read_sessions(database, 1000, 3000, message_usage=True))
++
++    assert sessions[0].model is None
++    assert sessions[0].input_tokens == 0
++    assert sessions[0].cache_read_tokens == 0
++    assert sessions[0].cost == 0.25
++
++
++def test_time_window_boundaries_and_overnight(tmp_path: Path) -> None:
++    database = tmp_path / "opencode.db"
++    make_database(database)
++    selected = date(2026, 11, 19)
++    midnight = _date_range(selected.isoformat())[1]
++    insert_session(database, "ses1", midnight - 86_400_000)
++    insert_message(database, "before", "ses1", midnight + 8 * 3_600_000 + 59 * 60_000)
++    insert_message(database, "included", "ses1", midnight + 9 * 3_600_000)
++    insert_message(database, "included2", "ses1", midnight + 10 * 3_600_000)
++    insert_message(database, "excluded", "ses1", midnight + 11 * 3_600_000)
++
++    start, end = _activity_range(selected, time(9), time(11))
++    sessions = list(read_sessions(database, start, end, message_usage=True))
++
++    assert sessions[0].input_tokens == 40
++    assert start == midnight + 9 * 3_600_000
++    assert end == midnight + 11 * 3_600_000
++
++    overnight_start, overnight_end = _activity_range(selected, time(23), time(2))
++    assert overnight_start == midnight + 23 * 3_600_000
++    assert overnight_end == midnight + 26 * 3_600_000
++    insert_message(database, "next-day", "ses1", overnight_start)
++    insert_message(database, "next-day2", "ses1", midnight + 25 * 3_600_000)
++    overnight = list(read_sessions(database, overnight_start, overnight_end, message_usage=True))
++    assert overnight[0].input_tokens == 40
++
++
++def test_forked_session_does_not_count_copied_messages(tmp_path: Path) -> None:
++    database = tmp_path / "opencode.db"
++    make_database(database)
++    insert_session(database, "original", 1000)
++    insert_session(database, "fork", 5000, fork_session_id="original")
++    insert_message(database, "copied", "fork", 4000, input_tokens=300)
++    insert_message(database, "new", "fork", 6000, input_tokens=15)
++
++    sessions = list(read_sessions(database, 2000, 7000, message_usage=True))
++    assert len(sessions) == 1
++    assert sessions[0].input_tokens == 15
++
++
++def test_legacy_and_missing_message_table_give_explanatory_errors(tmp_path: Path) -> None:
++    legacy = tmp_path / "legacy.db"
++    with sqlite3.connect(legacy) as connection:
++        connection.execute("CREATE TABLE session (id TEXT)")
++    with pytest.raises(ValueError, match="OpenCode v2"):
++        list(read_sessions(legacy, 0, 100, provider="openai"))
++
++    missing_message = tmp_path / "missing.db"
++    with sqlite3.connect(missing_message) as connection:
++        connection.execute("CREATE TABLE session_v2 (id TEXT)")
++    with pytest.raises(ValueError, match="session_message"):
++        list(read_sessions(missing_message, 0, 100, message_usage=True))
++
++
++def test_clock_time_validation_and_end_only(tmp_path: Path) -> None:
++    for value in ["9:00", "25:00", "12:60", "12:00:30", "12:00+03:00"]:
++        with pytest.raises(argparse.ArgumentTypeError):
++            _clock_time(value)
++    assert _clock_time("09:30") == time(9, 30)
++
++    selected = date(2026, 11, 19)
++    start, end = _activity_range(selected, None, time(12))
++    assert end - start == 12 * 60 * 60 * 1000
++    start, end = _activity_range(selected, None, time.min)
++    assert end - start == 24 * 60 * 60 * 1000
++
++
++def test_cli_json_with_all_filters(tmp_path: Path) -> None:
++    database = tmp_path / "opencode.db"
++    make_database(database)
++    selected = "2026-11-19"
++    midnight = _date_range(selected)[1]
++    insert_session(database, "ses1", midnight - 50_000)
++    insert_message(database, "wrong_hour", "ses1", midnight + 8 * 3_600_000)
++    insert_message(database, "wrong_provider", "ses1", midnight + 9 * 3_600_000,
++                   provider="anthropic")
++    insert_message(database, "correct", "ses1", midnight + 9 * 3_600_000,
++                   model="model-a", provider="openai", input_tokens=42)
++
++    result = subprocess.run(
++        [sys.executable, "-m", "opencode_stats", "--date", selected,
++         "--database", str(database), "--provider", "openai",
++         "--model", "model-a", "--start-time", "09:00",
++         "--end-time", "10:00", "--json"],
++        check=True, capture_output=True, text=True,
++    )
++    report = json.loads(result.stdout)
++    assert report["session_count"] == 1
++    assert report["totals"]["input_tokens"] == 42
++    assert report["aggregation"] == "message"
++    assert report["filters"]["model"] == "model-a"
++    assert report["filters"]["provider"] == "openai"
++
++
++def test_sql_parameters_are_not_interpolated(tmp_path: Path) -> None:
++    database = tmp_path / "opencode.db"
++    make_database(database)
++    insert_session(database, "ses1", 1000)
++    insert_message(database, "msg1", "ses1", 2000)
++    assert list(read_sessions(database, 0, 3000, model="model-a' OR 1=1 --")) == []

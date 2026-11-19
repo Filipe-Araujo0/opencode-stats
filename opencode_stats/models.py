@@ -15,6 +15,7 @@ class SessionUsage:
     cache_read_tokens: int
     cache_write_tokens: int
     cost: float
+    provider: str | None = None
 
     @property
     def cache_hit_rate(self) -> float | None:
