@@ -5,7 +5,7 @@ from typing import Any
 @dataclass(frozen=True)
 class SessionUsage:
     session_id: str
-    title: str
+    title: str | None
     directory: str
     model: str | None
     created_at_ms: int
